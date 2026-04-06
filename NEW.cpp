@@ -8,32 +8,46 @@
 #include <mutex>
 #include <atomic>
 #include <condition_variable>
-#include <memory>      // для unique_ptr, make_unique
-#include <cstddef>     // для size_t
+#include <memory>
 
 using namespace std;
 using namespace chrono;
 
-// ==================== СТРУКТУРА ЗАДАЧИ ====================
-struct ClusterTask {
-    int id;                 // ID задачи
-    int priority;           // 1 - высокая, 2 - средняя, 3 - низкая
-    int duration;           // время выполнения (мс)
-    int required_power;     // требуемая мощность (1-3)
-    bool is_critical;       // критическая задача?
 
+struct ClusterTask {
+    int id;
+    int priority;           // 1 - высокая, 2 - средняя, 3 - низкая
+    int duration;
+    int required_power;
+    bool is_critical;
+
+    
+    // 1. Неявно - внутри priority_queue
+    // 2. Явно - в функции compare_tasks() для демонстрации
     bool operator<(const ClusterTask& other) const {
-        // Чем меньше priority, тем выше приоритет
         if (priority != other.priority)
-            return priority > other.priority;
-        // Если приоритет одинаковый, критическая задача важнее
+            return priority > other.priority;  
         if (is_critical != other.is_critical)
-            return !is_critical;
+            return !is_critical;               
         return false;
     }
 };
 
-// ==================== КЛАСС СЕРВЕРА ====================
+
+void compare_tasks(const ClusterTask& t1, const ClusterTask& t2) {
+    cout << "Comparing tasks #" << t1.id << " and #" << t2.id << ": ";
+    if (t1 < t2) {
+        cout << "Task #" << t1.id << " is HIGHER priority than #" << t2.id << endl;
+    }
+    else if (t2 < t1) {
+        cout << "Task #" << t2.id << " is HIGHER priority than #" << t1.id << endl;
+    }
+    else {
+        cout << "Tasks have the SAME priority" << endl;
+    }
+}
+
+
 class Server {
 public:
     int id;
@@ -41,32 +55,10 @@ public:
     int current_load;
     bool active;
     mutex mtx;
+    counting_semaphore<> sem;
 
-    Server(int _id, int _max_power = 3) : id(_id), max_power(_max_power),
-        current_load(0), active(true) {
-    }
-
-    // Запрещаем копирование
-    Server(const Server&) = delete;
-    Server& operator=(const Server&) = delete;
-
-    // Разрешаем перемещение
-    Server(Server&& other) noexcept
-        : id(other.id),
-        max_power(other.max_power),
-        current_load(other.current_load),
-        active(other.active) {
-        // mutex не нужно перемещать
-    }
-
-    Server& operator=(Server&& other) noexcept {
-        if (this != &other) {
-            id = other.id;
-            max_power = other.max_power;
-            current_load = other.current_load;
-            active = other.active;
-        }
-        return *this;
+    Server(int _id, int _max_power = 3)
+        : id(_id), max_power(_max_power), current_load(0), active(true), sem(1) {
     }
 
     bool can_handle_task(const ClusterTask& task) {
@@ -87,16 +79,14 @@ public:
     }
 };
 
-// ==================== КЛАСС КЛАСТЕРНОЙ СИСТЕМЫ ====================
 class ClusterSystem {
 private:
     vector<unique_ptr<Server>> servers;
-    priority_queue<ClusterTask> task_queue;
+    priority_queue<ClusterTask> task_queue;  
     mutex queue_mtx;
     mutex output_mtx;
     condition_variable cv;
     atomic<bool> running{ true };
-    atomic<int> active_servers{ 0 };
     atomic<int> total_tasks_processed{ 0 };
 
     random_device rd;
@@ -105,14 +95,12 @@ private:
     uniform_int_distribution<> power_dist{ 1, 3 };
 
 public:
-    ClusterSystem(int initial_servers = 5) : gen(rd()) {
-        for (int i = 0; i < initial_servers; i++) {
+    ClusterSystem(int num_servers = 5) : gen(rd()) {
+        for (int i = 0; i < num_servers; i++) {
             servers.push_back(make_unique<Server>(i + 1));
         }
-        active_servers = initial_servers;
     }
 
-    // Добавление задачи в очередь
     void add_task(int id, int priority, bool is_critical = false) {
         ClusterTask task;
         task.id = id;
@@ -121,56 +109,60 @@ public:
         task.required_power = power_dist(gen);
         task.is_critical = is_critical;
 
+        
         {
             lock_guard<mutex> lock(queue_mtx);
+            if (!task_queue.empty()) {
+                const ClusterTask& top = task_queue.top();
+                cout << "[COMPARE] New task #" << id;
+                if (task < top) {
+                    cout << " has higher priority than current top task (#" << top.id << ")" << endl;
+                }
+                else if (top < task) {
+                    cout << " has lower priority than current top task (#" << top.id << ")" << endl;
+                }
+                else {
+                    cout << " has the same priority as current top task (#" << top.id << ")" << endl;
+                }
+            }
             task_queue.push(task);
         }
 
         {
             lock_guard<mutex> lock(output_mtx);
-            cout << "[Added] Task #" << id
+            cout << "[ADD] Task #" << id
                 << " | Priority: " << priority
                 << " | Power: " << task.required_power
-                << " | Time: " << task.duration / 1000.0 << " сек";
-            if (is_critical) cout << " (CRITICAL!)";
+                << " | Time: " << task.duration / 1000.0 << "sec";
+            if (is_critical) cout << " [CRITICAL]";
             cout << endl;
         }
 
         cv.notify_one();
     }
 
-    // Запуск дополнительного сервера при перегрузке
-    void add_backup_server() {
-        lock_guard<mutex> lock(output_mtx);
-        int new_id = servers.size() + 1;
-        servers.push_back(make_unique<Server>(new_id));
-        active_servers++;
-        cout << "\n[!!!] Reloading extra server #" << new_id
-            << " (total servers: " << active_servers << ")\n" << endl;
-    }
-
-    // Проверка нагрузки на кластер
-    void check_cluster_load() {
-        double total_load = 0;
-        int active_count = 0;
-
-        for (auto& server : servers) {
-            if (server->active) {
-                total_load += server->get_load_percent();
-                active_count++;
-            }
+    // Функция для демонстрации сортировки с использованием operator<
+    void demonstrate_priority_queue() {
+        lock_guard<mutex> lock(queue_mtx);
+        if (task_queue.empty()) {
+            cout << "Queue is empty" << endl;
+            return;
         }
 
-        if (active_count > 0) {
-            double avg_load = total_load / active_count;
-
-            if (avg_load > 80 && active_servers == (int)servers.size()) {
-                add_backup_server();
-            }
+        cout << "\n=== CURRENT QUEUE ===" << endl;
+        auto temp_queue = task_queue;
+        int pos = 1;
+        while (!temp_queue.empty()) {
+            ClusterTask t = temp_queue.top();
+            temp_queue.pop();
+            cout << pos++ << ". task #" << t.id
+                << " (priority=" << t.priority
+                << (t.is_critical ? ", CRITICAL" : "")
+                << ")" << endl;
         }
+        cout << "===================================================\n" << endl;
     }
 
-    // Функция обработки задач на сервере
     void server_worker(int server_idx) {
         Server& server = *servers[server_idx];
 
@@ -194,26 +186,15 @@ public:
                         task_queue.pop();
                         has_task = true;
                         server.add_task(current_task);
-                    }
-                    else {
-                        bool handled = false;
-                        for (auto& other : servers) {
-                            if (other.get() != &server && other->can_handle_task(temp)) {
-                                current_task = temp;
-                                task_queue.pop();
-                                has_task = true;
-                                other->add_task(current_task);
-                                {
-                                    lock_guard<mutex> lock(output_mtx);
-                                    cout << "CHANGE task" << current_task.id
-                                        << " changed from server  #" << server.id
-                                        << " to server #" << other->id << endl;
-                                }
-                                break;
+                        server.sem.acquire();
+
+                        // === ЕЩЕ ОДНО ЯВНОЕ ИСПОЛЬЗОВАНИЕ operator< ===
+                        if (!task_queue.empty()) {
+                            const ClusterTask& next = task_queue.top();
+                            cout << "[SCHED] Next task in queue: #" << next.id;
+                            if (next < current_task) {
+                                cout << " (has higher priority than the most recent task #" << current_task.id << ")" << endl;
                             }
-                        }
-                        if (!handled) {
-                            continue;
                         }
                     }
                 }
@@ -222,38 +203,35 @@ public:
             if (has_task) {
                 {
                     lock_guard<mutex> lock(output_mtx);
-                    cout << "doing srver #" << server.id
-                        << " | task#" << current_task.id
-                        << " (priority: " << current_task.priority;
-                    if (current_task.is_critical) cout << ", Critical";
-                    cout << ") | Time: " << current_task.duration / 1000.0 << " sec" << endl;
+                    cout << "[WORK] server #" << server.id
+                        << " | task #" << current_task.id
+                        << " (priority=" << current_task.priority;
+                    if (current_task.is_critical) cout << ", CRITICAL";
+                    cout << ") | " << current_task.duration / 1000.0 << "sec" << endl;
                 }
 
                 this_thread::sleep_for(milliseconds(current_task.duration));
 
+                server.sem.release();
                 server.remove_task(current_task);
                 total_tasks_processed++;
 
                 {
                     lock_guard<mutex> lock(output_mtx);
-                    cout << "Ready server #" << server.id
-                        << " task done #" << current_task.id
-                        << " | Loading server: " << server.get_load_percent() << "%" << endl;
+                    cout << "[DONE] server #" << server.id
+                        << " is done #" << current_task.id << endl;
                 }
-
-                check_cluster_load();
             }
         }
     }
 
-    // Запуск кластерной системы
     void run(int num_tasks) {
         vector<thread> workers;
-
         for (size_t i = 0; i < servers.size(); i++) {
             workers.emplace_back(&ClusterSystem::server_worker, this, i);
         }
 
+        // Добавляем задачи с разными приоритетами
         for (int i = 1; i <= num_tasks; i++) {
             int priority;
             bool is_critical = false;
@@ -270,10 +248,16 @@ public:
             }
 
             add_task(i, priority, is_critical);
-            this_thread::sleep_for(milliseconds(500));
+
+            // Каждые 3 задачи показываем состояние очереди
+            if (i % 3 == 0) {
+                demonstrate_priority_queue();
+            }
+
+            this_thread::sleep_for(milliseconds(800));
         }
 
-        this_thread::sleep_for(seconds(10));
+        this_thread::sleep_for(seconds(8));
         running = false;
         cv.notify_all();
 
@@ -281,30 +265,27 @@ public:
             t.join();
         }
 
-        {
-            lock_guard<mutex> lock(output_mtx);
-           
-            cout << "Total task done: " << total_tasks_processed << endl;
-            cout << "Active servers: " << active_servers << endl;
-            cout << "Status serverrs:" << endl;
-            for (auto& server : servers) {
-                cout << "  server #" << server->id << ": loading"
-                    << server->get_load_percent() << "% | "
-                    << (server->active ? "active" : "off") << endl;
-            }
-            cout << "==========================================" << endl;
-        }
+        cout << "\n=== THE END ===" << endl;
+        cout << "Tasks done: " << total_tasks_processed << endl;
     }
 };
 
-// ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
+// ==================== ГЛАВНАЯ ====================
 int main() {
-   
+    ClusterSystem cluster(3);
 
-    ClusterSystem cluster(5);
-    cluster.run(15);
+    // Демонстрация явного сравнения задач
+    
+    ClusterTask taskA{ 1, 1, 1000, 2, false };
+    ClusterTask taskB{ 2, 2, 1000, 2, false };
+    ClusterTask taskC{ 3, 1, 1000, 2, true };
 
-    cout << "\nDONE!" << endl;
+    compare_tasks(taskA, taskB); 
+    compare_tasks(taskA, taskC); 
+    compare_tasks(taskB, taskC);  
+    cout << endl;
+
+    cluster.run(10);
 
     return 0;
 }
