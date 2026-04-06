@@ -7,7 +7,6 @@
 #include <chrono>
 #include <random>
 #include <string>
-#include <climits>
 #include <memory>
 
 using namespace std;
@@ -20,22 +19,14 @@ struct Car {
     string direction;
 
     Car(int _id, int _priority, string _dir)
-        : id(_id), priority(_priority), direction(_dir) {
-    }
+        : id(_id), priority(_priority), direction(_dir) {}
 
-    // Добавляем конструктор копирования для безопасности
-    Car(const Car& other)
-        : id(other.id), priority(other.priority), direction(other.direction) {
-    }
-
-    // Оператор присваивания
-    Car& operator=(const Car& other) {
-        if (this != &other) {
-            id = other.id;
-            priority = other.priority;
-            direction = other.direction;
-        }
-        return *this;
+    // operator< for priority comparison (used by priority_queue)
+    // Lower number = higher priority
+    bool operator<(const Car& other) const {
+        if (priority != other.priority)
+            return priority > other.priority;  // 1 > 2? No, so 1 comes first
+        return id > other.id;  // tie-breaker
     }
 };
 
@@ -45,21 +36,20 @@ private:
     mutex mtx;
     int green_duration;
     bool emergency_mode;
+    int light_id;
 
 public:
-    int id;
+    TrafficLight(int _id) : light_id(_id), green_duration(30), emergency_mode(false) {}
 
-    TrafficLight(int _id) : id(_id), green_duration(30), emergency_mode(false) {}
+    int getId() const { return light_id; }
 
     void adapt_green_time(int car_count) {
         lock_guard<mutex> lock(mtx);
         if (car_count > 20) {
             green_duration = 45;
-        }
-        else if (car_count > 10) {
+        } else if (car_count > 10) {
             green_duration = 35;
-        }
-        else {
+        } else {
             green_duration = 25;
         }
     }
@@ -73,14 +63,14 @@ public:
         lock_guard<mutex> lock(mtx);
         emergency_mode = true;
         green_duration = 10;
-        cout << "[ALERT] Emergency mode activated at intersection #" << id << "!" << endl;
+        cout << "[ALERT] Emergency mode activated at intersection #" << light_id << "!" << endl;
     }
 
     void deactivate_emergency() {
         lock_guard<mutex> lock(mtx);
         emergency_mode = false;
         green_duration = 30;
-        cout << "[INFO] Emergency mode deactivated at intersection #" << id << endl;
+        cout << "[INFO] Emergency mode deactivated at intersection #" << light_id << endl;
     }
 
     bool is_emergency() {
@@ -93,29 +83,30 @@ public:
 class Intersection {
 private:
     mutex mtx;
-    queue<Car> car_queue;
+    priority_queue<Car> car_queue;  // USES operator< for sorting!
     atomic<int> cars_passed;
+    int intersection_id;
+    TrafficLight traffic_light;
 
 public:
-    int id;
-    TrafficLight light;
+    Intersection(int _id) : intersection_id(_id), traffic_light(_id), cars_passed(0) {}
 
-    Intersection(int _id) : id(_id), light(_id), cars_passed(0) {}
+    // Getters for private members
+    int getId() const { return intersection_id; }
+    TrafficLight& getLight() { return traffic_light; }
 
-    // Запрещаем копирование для безопасности
     Intersection(const Intersection&) = delete;
     Intersection& operator=(const Intersection&) = delete;
 
-    // Разрешаем перемещение
-    Intersection(Intersection&& other) noexcept
-        : id(other.id), light(other.id), cars_passed(other.cars_passed.load()) {
-        lock_guard<mutex> lock(other.mtx);
-        car_queue = move(other.car_queue);
-    }
-
     void add_car(const Car& car) {
         lock_guard<mutex> lock(mtx);
-        car_queue.push(car);
+        car_queue.push(car);  // operator< is called HERE internally
+        
+        // CONFLICT LOGGING: Show priority order
+        if (!car_queue.empty() && car_queue.top().id == car.id) {
+            cout << "[PRIORITY] Car #" << car.id << " (priority " << car.priority
+                 << ") is NOW at the front of intersection #" << intersection_id << " queue!" << endl;
+        }
     }
 
     size_t get_queue_size() {
@@ -125,55 +116,35 @@ public:
 
     int process_cars() {
         lock_guard<mutex> lock(mtx);
+        
+        if (car_queue.empty()) return 0;
 
-        // Separate cars by priority
-        vector<Car> emergency_cars;
-        vector<Car> regular_cars;
+        int green_time = traffic_light.get_green_duration();
+        size_t capacity = static_cast<size_t>(green_time / 2);
+        
+        int passed = 0;
 
-        while (!car_queue.empty()) {
-            Car car = car_queue.front();
+        // Process cars in priority order (automatically sorted by operator<)
+        for (size_t i = 0; i < capacity && !car_queue.empty(); ++i) {
+            Car car = car_queue.top();
             car_queue.pop();
-
-            if (car.priority == 1) {
-                emergency_cars.push_back(car);
-            }
-            else {
-                regular_cars.push_back(car);
-            }
-        }
-
-        // Emergency cars go first
-        vector<Car> all_cars;
-        all_cars.reserve(emergency_cars.size() + regular_cars.size());
-
-        for (auto& car : emergency_cars) {
-            all_cars.push_back(car);
-        }
-        for (auto& car : regular_cars) {
-            all_cars.push_back(car);
-        }
-
-        // Calculate how many cars can pass
-        int green_time = light.get_green_duration();
-        size_t capacity = static_cast<size_t>(green_time / 2);  // ~2 seconds per car
-
-        size_t passed = 0;
-        for (size_t i = 0; i < all_cars.size() && i < capacity; ++i) {
             passed++;
             cars_passed++;
 
-            if (all_cars[i].priority == 1) {
-                cout << "  >> Emergency car #" << all_cars[i].id
-                    << " passed intersection #" << id << endl;
+            // CONFLICT LOGGING: Show when emergency preempts
+            if (car.priority == 1) {
+                cout << "  [EMERGENCY] Car #" << car.id << " passed intersection #" << intersection_id 
+                     << " (preempting normal traffic)" << endl;
             }
         }
 
-        // Put remaining cars back in queue
-        for (size_t i = capacity; i < all_cars.size(); ++i) {
-            car_queue.push(all_cars[i]);
+        // Log if queue is still long after processing
+        if (!car_queue.empty() && car_queue.size() > 15) {
+            cout << "[CONFLICT] Intersection #" << intersection_id << " still has " << car_queue.size()
+                 << " cars waiting after green phase!" << endl;
         }
 
-        return static_cast<int>(passed);
+        return passed;
     }
 
     int get_cars_passed() const {
@@ -184,36 +155,53 @@ public:
         lock_guard<mutex> lock(mtx);
         return car_queue.size() > 30;
     }
+
+    void show_queue_status() {
+        lock_guard<mutex> lock(mtx);
+        if (car_queue.empty()) return;
+        
+        // DEMONSTRATE operator< usage - peek at next car
+        Car next = car_queue.top();
+        cout << "  [QUEUE] Intersection #" << intersection_id << " next car: #" << next.id 
+             << " (priority " << next.priority << ")" << endl;
+    }
 };
 
-// ==================== TRAFFIC CONTROL SYSTEM ====================
+// ==================== SINGLETON TRAFFIC CONTROL SYSTEM ====================
 class TrafficControlSystem {
 private:
-    vector<Intersection> intersections;
+    static unique_ptr<TrafficControlSystem> instance;
+    static mutex instance_mutex;
+
+    vector<unique_ptr<Intersection>> intersections;
     mutex cout_mtx;
     atomic<bool> running;
     random_device rd;
     mt19937 gen;
 
-public:
+    // Private constructor (Singleton)
     TrafficControlSystem() : running(true), gen(rd()) {
-        // Create 10 intersections
-        intersections.reserve(10);
         for (int i = 1; i <= 10; ++i) {
-            intersections.emplace_back(i);
+            intersections.push_back(make_unique<Intersection>(i));
         }
     }
 
-    // Запрещаем копирование
+public:
     TrafficControlSystem(const TrafficControlSystem&) = delete;
     TrafficControlSystem& operator=(const TrafficControlSystem&) = delete;
 
-    // Generate random cars at intersections
+    static TrafficControlSystem* getInstance() {
+        lock_guard<mutex> lock(instance_mutex);
+        if (!instance) {
+            instance = unique_ptr<TrafficControlSystem>(new TrafficControlSystem());
+        }
+        return instance.get();
+    }
+
     void generate_traffic() {
         uniform_int_distribution<> cars_per_cycle(0, 12);
         uniform_int_distribution<> priority_dist(1, 100);
         vector<string> directions = { "North", "South", "East", "West" };
-
         int car_id = 0;
 
         while (running.load()) {
@@ -224,48 +212,42 @@ public:
 
                 for (int i = 0; i < num_cars; ++i) {
                     ++car_id;
-
-                    // Determine priority
                     int priority;
                     int rand_val = priority_dist(gen);
 
-                    if (rand_val <= 5) {          // 5% emergency
-                        priority = 1;
-                    }
-                    else if (rand_val <= 20) {   // 15% public transport
-                        priority = 2;
-                    }
-                    else {                        // 80% regular
-                        priority = 3;
+                    if (rand_val <= 5) {
+                        priority = 1;  // emergency
+                    } else if (rand_val <= 20) {
+                        priority = 2;  // public transport
+                    } else {
+                        priority = 3;  // regular
                     }
 
                     string direction = directions[rand() % 4];
                     Car car(car_id, priority, direction);
-                    intersection.add_car(car);
+                    intersection->add_car(car);
 
-                    // Emergency vehicle handling
+                    // CONFLICT LOGGING: Emergency vehicle arrival
                     if (priority == 1) {
                         {
                             lock_guard<mutex> lock(cout_mtx);
                             cout << "\n[!!!] EMERGENCY VEHICLE #" << car_id
-                                << " approaching intersection #" << intersection.id << "!" << endl;
+                                 << " approaching intersection #" << intersection->getId() << "!" << endl;
+                            cout << "[CONFLICT] Preempting normal traffic at intersection #" 
+                                 << intersection->getId() << endl;
                         }
-                        intersection.light.activate_emergency();
+                        intersection->getLight().activate_emergency();
 
-                        // Используем shared_ptr для безопасной работы с потоками
-                        // Создаем копию id, так как intersection может измениться
-                        int intersection_id = intersection.id;
-
+                        int intersection_id = intersection->getId();
                         thread emergency_thread([this, intersection_id]() {
                             this_thread::sleep_for(seconds(5));
-                            // Находим нужный перекресток по id
                             for (auto& inter : intersections) {
-                                if (inter.id == intersection_id) {
-                                    inter.light.deactivate_emergency();
+                                if (inter->getId() == intersection_id) {
+                                    inter->getLight().deactivate_emergency();
                                     break;
                                 }
                             }
-                            });
+                        });
                         emergency_thread.detach();
                     }
                 }
@@ -273,45 +255,40 @@ public:
         }
     }
 
-    // Control traffic lights based on traffic
     void control_traffic() {
         while (running.load()) {
             for (auto& intersection : intersections) {
-                size_t queue_size = intersection.get_queue_size();
+                size_t queue_size = intersection->get_queue_size();
+                intersection->getLight().adapt_green_time(static_cast<int>(queue_size));
 
-                // Adapt green light duration
-                intersection.light.adapt_green_time(static_cast<int>(queue_size));
-
-                // Check for congestion
-                if (intersection.is_congested()) {
-                    {
-                        lock_guard<mutex> lock(cout_mtx);
-                        cout << "\n[CONGESTION] Intersection #" << intersection.id
-                            << " has " << queue_size << " cars waiting!" << endl;
-                        cout << "[ACTION] Increasing green light duration to 45 seconds" << endl;
-                    }
+                // CONFLICT LOGGING: Congestion detection
+                if (intersection->is_congested()) {
+                    lock_guard<mutex> lock(cout_mtx);
+                    cout << "\n[CONFLICT] Intersection #" << intersection->getId()
+                         << " CONGESTED with " << queue_size << " cars waiting!" << endl;
+                    cout << "[ACTION] Green light extended to 45 seconds" << endl;
                 }
 
-                // Process cars at this intersection
-                int passed = intersection.process_cars();
+                int passed = intersection->process_cars();
 
-                if (passed > 0) {
+                if (passed > 0 || intersection->get_queue_size() > 0) {
                     lock_guard<mutex> lock(cout_mtx);
-                    cout << "[INTERSECTION #" << intersection.id << "] "
-                        << passed << " cars passed | Queue: " << intersection.get_queue_size()
-                        << " | Green: " << intersection.light.get_green_duration() << "s";
-                    if (intersection.light.is_emergency()) {
+                    cout << "[INTERSECTION #" << intersection->getId() << "] "
+                         << passed << " cars passed | Queue: " << intersection->get_queue_size()
+                         << " | Green: " << intersection->getLight().get_green_duration() << "s";
+                    if (intersection->getLight().is_emergency()) {
                         cout << " | EMERGENCY MODE";
                     }
                     cout << endl;
+                    
+                    // Show next car in queue (demonstrates operator<)
+                    intersection->show_queue_status();
                 }
             }
-
             this_thread::sleep_for(seconds(3));
         }
     }
 
-    // Monitor system status
     void monitor() {
         while (running.load()) {
             this_thread::sleep_for(seconds(10));
@@ -324,8 +301,8 @@ public:
             int congested = 0;
 
             for (auto& intersection : intersections) {
-                size_t queue = intersection.get_queue_size();
-                int passed = intersection.get_cars_passed();
+                size_t queue = intersection->get_queue_size();
+                int passed = intersection->get_cars_passed();
                 total_cars += queue;
                 total_passed += passed;
                 if (queue > 20) ++congested;
@@ -338,34 +315,29 @@ public:
         }
     }
 
-    void run(int duration_seconds = 40) {
+    void run(int duration_seconds = 45) {
         cout << "\n========== TRAFFIC SYSTEM STARTED ==========" << endl;
         cout << "Simulating 10 intersections with adaptive traffic lights" << endl;
+        cout << "operator< is used by priority_queue for car sorting" << endl;
         cout << "=============================================\n" << endl;
 
-        // Start threads
         thread traffic_thread(&TrafficControlSystem::generate_traffic, this);
         thread control_thread(&TrafficControlSystem::control_traffic, this);
         thread monitor_thread(&TrafficControlSystem::monitor, this);
 
-        // Run for specified duration
         this_thread::sleep_for(seconds(duration_seconds));
-
-        // Stop system
         running.store(false);
 
-        // Wait for threads to finish
         traffic_thread.join();
         control_thread.join();
         monitor_thread.join();
 
-        // Print final statistics
         cout << "\n========== FINAL STATISTICS ==========" << endl;
         int total_passed = 0;
         for (auto& intersection : intersections) {
-            int passed = intersection.get_cars_passed();
+            int passed = intersection->get_cars_passed();
             total_passed += passed;
-            cout << "Intersection #" << intersection.id << ": " << passed << " cars" << endl;
+            cout << "Intersection #" << intersection->getId() << ": " << passed << " cars" << endl;
         }
         cout << "----------------------------------------" << endl;
         cout << "TOTAL CARS PROCESSED: " << total_passed << endl;
@@ -373,17 +345,20 @@ public:
     }
 };
 
-// ==================== MAIN FUNCTION ====================
+// Singleton static members initialization
+unique_ptr<TrafficControlSystem> TrafficControlSystem::instance = nullptr;
+mutex TrafficControlSystem::instance_mutex;
+
+// ==================== MAIN ====================
 int main() {
     try {
-        TrafficControlSystem traffic;
-        traffic.run(45);  // Run simulation for 45 seconds
+        TrafficControlSystem* traffic = TrafficControlSystem::getInstance();
+        traffic->run(45);
         cout << "\nSimulation completed successfully!" << endl;
     }
     catch (const exception& e) {
         cerr << "Error: " << e.what() << endl;
         return 1;
     }
-
     return 0;
 }
