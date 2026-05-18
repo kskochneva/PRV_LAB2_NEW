@@ -13,7 +13,7 @@
 using namespace std;
 using namespace chrono;
 
-
+//создаю структуру заадания
 struct ClusterTask {
     int id;
     int priority;           // 1 - высокая, 2 - средняя, 3 - низкая
@@ -21,19 +21,19 @@ struct ClusterTask {
     int required_power;
     bool is_critical;
 
-    
-    // 1. Неявно - внутри priority_queue
-    // 2. Явно - в функции compare_tasks() для демонстрации
+
+    //  неявно исп внутри priority_queue
+    // явно  в функции compare_tasks() для демонстрации
     bool operator<(const ClusterTask& other) const {
         if (priority != other.priority)
-            return priority > other.priority;  
+            return priority > other.priority;
         if (is_critical != other.is_critical)
-            return !is_critical;               
+            return !is_critical;
         return false;
     }
 };
 
-
+//метод сравнеия для очереди
 void compare_tasks(const ClusterTask& t1, const ClusterTask& t2) {
     cout << "Comparing tasks #" << t1.id << " and #" << t2.id << ": ";
     if (t1 < t2) {
@@ -56,6 +56,8 @@ public:
     bool active;
     mutex mtx;
     counting_semaphore<> sem;
+    //(бинарный семафор)
+    //один сервер может выполнять только одну задачу одновременно
 
     Server(int _id, int _max_power = 3)
         : id(_id), max_power(_max_power), current_load(0), active(true), sem(1) {
@@ -82,10 +84,12 @@ public:
 class ClusterSystem {
 private:
     vector<unique_ptr<Server>> servers;
-    priority_queue<ClusterTask> task_queue;  
-    mutex queue_mtx;
-    mutex output_mtx;
-    condition_variable cv;
+    priority_queue<ClusterTask> task_queue;
+    mutex queue_mtx;//защита очереди
+    mutex output_mtx;//и вывода
+    condition_variable cv;//мех синх потоков
+    //один поток ждет другой уведомляет
+    //далее есть поток add task и серверы ожидающие задачи
     atomic<bool> running{ true };
     atomic<int> total_tasks_processed{ 0 };
 
@@ -109,7 +113,7 @@ public:
         task.required_power = power_dist(gen);
         task.is_critical = is_critical;
 
-        
+
         {
             lock_guard<mutex> lock(queue_mtx);
             if (!task_queue.empty()) {
@@ -138,7 +142,7 @@ public:
             cout << endl;
         }
 
-        cv.notify_one();
+        cv.notify_one();//в произв исп при добавл зад
     }
 
     // Функция для демонстрации сортировки с использованием operator<
@@ -160,7 +164,7 @@ public:
                 << (t.is_critical ? ", CRITICAL" : "")
                 << ")" << endl;
         }
-        cout << "===================================================\n" << endl;
+        cout << "                                                \n" << endl;
     }
 
     void server_worker(int server_idx) {
@@ -172,6 +176,7 @@ public:
 
             {
                 unique_lock<mutex> lock(queue_mtx);
+                //чждем покп в очереди покажутся задаи
                 cv.wait(lock, [this] {
                     return !task_queue.empty() || !running;
                     });
@@ -186,7 +191,7 @@ public:
                         task_queue.pop();
                         has_task = true;
                         server.add_task(current_task);
-                        server.sem.acquire();
+                        server.sem.acquire();//захват семафора
 
                         // === ЕЩЕ ОДНО ЯВНОЕ ИСПОЛЬЗОВАНИЕ operator< ===
                         if (!task_queue.empty()) {
@@ -259,7 +264,8 @@ public:
 
         this_thread::sleep_for(seconds(8));
         running = false;
-        cv.notify_all();
+        cv.notify_all();//исп в производителе при добавлении задач
+        //нужен для меньшего потребления cpu
 
         for (auto& t : workers) {
             t.join();
@@ -275,14 +281,14 @@ int main() {
     ClusterSystem cluster(3);
 
     // Демонстрация явного сравнения задач
-    
+
     ClusterTask taskA{ 1, 1, 1000, 2, false };
     ClusterTask taskB{ 2, 2, 1000, 2, false };
     ClusterTask taskC{ 3, 1, 1000, 2, true };
 
-    compare_tasks(taskA, taskB); 
-    compare_tasks(taskA, taskC); 
-    compare_tasks(taskB, taskC);  
+    compare_tasks(taskA, taskB);
+    compare_tasks(taskA, taskC);
+    compare_tasks(taskB, taskC);
     cout << endl;
 
     cluster.run(10);
