@@ -352,11 +352,11 @@ public:
     }
 };
 
-// Singleton static members initialization
+// один на всю лабу
 unique_ptr<TrafficControlSystem> TrafficControlSystem::instance = nullptr;
 mutex TrafficControlSystem::instance_mutex;
 
-// ==================== MAIN ====================
+
 int main() {
     try {
         TrafficControlSystem* traffic = TrafficControlSystem::getInstance();
